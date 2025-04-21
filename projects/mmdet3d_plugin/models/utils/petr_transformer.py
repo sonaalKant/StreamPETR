@@ -476,6 +476,10 @@ class PETRTemporalTransformer(BaseModule):
                 - memory: Output results from encoder, with shape \
                       [bs, embed_dims, h, w].
         """
+        # import pdb;pdb.set_trace()
+        # memory --> 1,6000, 256
+        # query_pos --> [1,900, 256]
+        # pos_embed --> [1, 6000, shape]
         memory = memory.transpose(0, 1).contiguous()
         query_pos = query_pos.transpose(0, 1).contiguous()
         pos_embed = pos_embed.transpose(0, 1).contiguous()

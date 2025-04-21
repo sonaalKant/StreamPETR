@@ -11,6 +11,7 @@
 # ------------------------------------------------------------------------
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from mmcv.cnn import Linear, bias_init_with_prob
 
 from mmcv.runner import force_fp32
@@ -27,6 +28,71 @@ from mmdet.models.utils import NormedLinear
 from projects.mmdet3d_plugin.models.utils.positional_encoding import pos2posemb3d, pos2posemb1d, nerf_positional_encoding
 from projects.mmdet3d_plugin.models.utils.misc import MLN, topk_gather, transform_reference_points, memory_refresh, SELayer_Linear
 
+class DecoderBlock(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, skip_dim, residual, factor):
+        super().__init__()
+
+        dim = out_channels // factor
+
+        self.conv = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            nn.Conv2d(in_channels, dim, 3, padding=1, bias=False),
+            # nn.BatchNorm2d(dim),
+            # nn.LayerNorm(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim, out_channels, 1, padding=0, bias=False),
+            # nn.BatchNorm2d(out_channels),
+            # nn.LayerNorm(out_channels),
+            )
+
+        if residual:
+            self.up = nn.Conv2d(skip_dim, out_channels, 1)
+        else:
+            self.up = None
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x, skip):
+        x = self.conv(x)
+
+        if self.up is not None:
+            up = self.up(skip)
+            up = F.interpolate(up, x.shape[-2:])
+
+            x = x + up
+
+        return self.relu(x)
+
+
+class Decoder(nn.Module):
+    def __init__(self, dim, blocks, out_dim,residual=True, factor=2):
+        super().__init__()
+
+        layers = list()
+        channels = dim
+
+        for out_channels in blocks:
+            layer = DecoderBlock(channels, out_channels, dim, residual, factor)
+            layers.append(layer)
+
+            channels = out_channels
+
+        self.layers = nn.Sequential(*layers)
+        self.out_channels = channels
+        self.to_logits = nn.Sequential(
+            nn.Conv2d(self.out_channels, self.out_channels, 3, padding=1, bias=False),
+            # nn.BatchNorm2d(self.out_channels),
+            # nn.LayerNorm(self.out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.out_channels, out_dim, 1))
+    def forward(self, x):
+        y = x
+
+        for layer in self.layers:
+            y = layer(y, x)
+        y=self.to_logits(y)
+        return y
+    
 @HEADS.register_module()
 class StreamPETRHead(AnchorFreeHead):
     """Implements the DETR transformer head.
@@ -74,6 +140,7 @@ class StreamPETRHead(AnchorFreeHead):
                  match_with_velo=True,
                  match_costs=None,
                  transformer=None,
+                 transformer_lane=None,
                  sync_cls_avg_factor=False,
                  code_weights=None,
                  bbox_coder=None,
@@ -188,6 +255,7 @@ class StreamPETRHead(AnchorFreeHead):
                                        dict(type='ReLU', inplace=True))
         self.num_pred = 6
         self.normedlinear = normedlinear
+        self.is_mm_seg = transformer_lane is not None
         super(StreamPETRHead, self).__init__(num_classes, in_channels, init_cfg = init_cfg)
 
         self.loss_cls = build_loss(loss_cls)
@@ -200,6 +268,9 @@ class StreamPETRHead(AnchorFreeHead):
             self.cls_out_channels = num_classes + 1
 
         self.transformer = build_transformer(transformer)
+
+        if self.is_mm_seg:
+            self.transformer_lane = build_transformer(transformer_lane)
 
         self.code_weights = nn.Parameter(torch.tensor(
             self.code_weights), requires_grad=False)
@@ -232,6 +303,20 @@ class StreamPETRHead(AnchorFreeHead):
 
     def _init_layers(self):
         """Initialize layers of the transformer head."""
+
+        if self.is_mm_seg:
+            self.blocks=[128,128,64]
+            lane_branch_dri = Decoder(self.embed_dims,self.blocks,1)
+            lane_branch_lan = Decoder(self.embed_dims,self.blocks,1)
+            lane_branch_vie = Decoder(self.embed_dims,self.blocks,1)
+
+            
+            self.lane_branches_dri = nn.ModuleList(
+                [lane_branch_dri for _ in range(self.num_pred)])
+            self.lane_branches_lan = nn.ModuleList(
+                [lane_branch_lan for _ in range(self.num_pred)])
+            self.lane_branches_vie = nn.ModuleList(
+                [lane_branch_vie for _ in range(self.num_pred)])
 
         cls_branch = []
         for _ in range(self.num_reg_fcs):
@@ -267,6 +352,13 @@ class StreamPETRHead(AnchorFreeHead):
                 nn.ReLU(),
                 nn.Linear(self.embed_dims, self.embed_dims),
             )
+        if self.is_mm_seg:
+            self.memory_embed_map = nn.Sequential(
+                    nn.Linear(self.in_channels, self.embed_dims),
+                    nn.ReLU(),
+                    nn.Linear(self.embed_dims, self.embed_dims),
+                )
+        
         
         # can be replaced with MLN
         self.featurized_pe = SELayer_Linear(self.embed_dims)
@@ -303,6 +395,8 @@ class StreamPETRHead(AnchorFreeHead):
             self.pseudo_reference_points.weight.requires_grad = False
 
         self.transformer.init_weights()
+        if self.is_mm_seg:
+            self.transformer_lane.init_weights()
         if self.loss_cls.use_sigmoid:
             bias_init = bias_init_with_prob(0.01)
             for m in self.cls_branches:
@@ -584,14 +678,21 @@ class StreamPETRHead(AnchorFreeHead):
         B, N, C, H, W = x.shape
         num_tokens = N * H * W
         memory = x.permute(0, 1, 3, 4, 2).reshape(B, num_tokens, C)
+        if self.is_mm_seg:
+            memory_map = topk_gather(memory, topk_indexes)
         memory = topk_gather(memory, topk_indexes)
 
         pos_embed, cone = self.position_embeding(data, memory_center, topk_indexes, img_metas)
 
         memory = self.memory_embed(memory)
+        if self.is_mm_seg:
+            memory_map = self.memory_embed_map(memory_map)
 
         # spatial_alignment in focal petr
         memory = self.spatial_alignment(memory, cone)
+        if self.is_mm_seg:
+            memory_map = self.spatial_alignment(memory_map, cone)
+            pos_embed_map = self.featurized_pe(pos_embed, memory_map)
         pos_embed = self.featurized_pe(pos_embed, memory)
 
         reference_points = self.reference_points.weight
@@ -604,6 +705,30 @@ class StreamPETRHead(AnchorFreeHead):
 
         # transformer here is a little different from PETR
         outs_dec, _ = self.transformer(memory, tgt, query_pos, pos_embed, attn_mask, temp_memory, temp_pos)
+
+        if self.is_mm_seg:
+            # TODO(Sonaal): Using same tgt which needs to be changed.
+            tgt = tgt[:, :625, :]
+            query_pos = query_pos[:, :625, :]
+            outs_dec_lane, _ = self.transformer_lane(memory_map, tgt, query_pos, pos_embed_map, attn_mask, temp_memory, temp_pos)
+            outs_dec_lane = torch.nan_to_num(outs_dec_lane)
+            lane_queries=outs_dec_lane
+
+            
+            outputs_classes = []
+            outputs_coords = []
+            outputs_lanes=[]
+            for lvl in range(outs_dec_lane.shape[0]):
+                lane_queries_lvl=lane_queries[lvl].view(1,25,25,-1).permute(0,3,1,2)
+                outputs_dri=self.lane_branches_dri[lvl](lane_queries_lvl)
+                outputs_lan=self.lane_branches_lan[lvl](lane_queries_lvl)
+                outputs_vie=self.lane_branches_vie[lvl](lane_queries_lvl)
+                
+                outputs_lane=torch.cat([outputs_dri,outputs_lan,outputs_vie],dim=1)
+                outputs_lane=outputs_lane.view(-1,3,200*200)
+                
+                outputs_lanes.append(outputs_lane)
+            all_lane_preds=torch.stack(outputs_lanes)
 
         outs_dec = torch.nan_to_num(outs_dec)
         outputs_classes = []
