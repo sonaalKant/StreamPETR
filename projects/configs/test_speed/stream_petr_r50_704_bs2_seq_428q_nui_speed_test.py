@@ -81,7 +81,7 @@ model = dict(
         type='StreamPETRHead',
         num_classes=10,
         in_channels=256,
-        num_query=300,
+        num_query=497,
         memory_len=512,
         topk_proposals=128,
         num_propagated=128,
@@ -121,33 +121,33 @@ model = dict(
                     operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
                                      'ffn', 'norm')),
             )),
-        # transformer_lane=dict(
-        #     type='PETRTemporalTransformer',
-        #     decoder=dict(
-        #         type='PETRTransformerDecoder',
-        #         return_intermediate=True,
-        #         num_layers=6,
-        #         transformerlayers=dict(
-        #             type='PETRTemporalDecoderLayer',
-        #             attn_cfgs=[
-        #                 dict(
-        #                     type='PETRMultiheadAttention',
-        #                     embed_dims=256,
-        #                     num_heads=8,
-        #                     dropout=0.1,
-        #                     fp16=True),
-        #                 dict(
-        #                     type='PETRMultiheadFlashAttention',
-        #                     embed_dims=256,
-        #                     num_heads=8,
-        #                     dropout=0.1),
-        #                 ],
-        #             feedforward_channels=2048,
-        #             ffn_dropout=0.1,
-        #             with_cp=False,
-        #             operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
-        #                              'ffn', 'norm')),
-        #     )),
+        transformer_lane=dict(
+            type='PETRTemporalTransformer',
+            decoder=dict(
+                type='PETRTransformerDecoder',
+                return_intermediate=True,
+                num_layers=6,
+                transformerlayers=dict(
+                    type='PETRTemporalDecoderLayer',
+                    attn_cfgs=[
+                        dict(
+                            type='PETRMultiheadAttention',
+                            embed_dims=256,
+                            num_heads=8,
+                            dropout=0.1,
+                            fp16=True),
+                        dict(
+                            type='PETRMultiheadAttention',
+                            embed_dims=256,
+                            num_heads=8,
+                            dropout=0.1),
+                        ],
+                    feedforward_channels=2048,
+                    ffn_dropout=0.1,
+                    with_cp=False,
+                    operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
+                                     'ffn', 'norm')),
+            )),
         bbox_coder=dict(
             type='NMSFreeCoder',
             post_center_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
@@ -235,7 +235,7 @@ test_pipeline = [
 
 data = dict(
     samples_per_gpu=batch_size,
-    workers_per_gpu=1, # workers_per_gpu may influence the inference speed
+    workers_per_gpu=4, # workers_per_gpu may influence the inference speed
     train=dict(
         type=dataset_type,
         data_root=data_root,
