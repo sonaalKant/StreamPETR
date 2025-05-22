@@ -284,18 +284,24 @@ def bev_to_camera_perspective_2(bev_mask, camera_intrinsic, euler_angles, transl
     
     tilde_x_c_1D = np.concatenate((d,-(1 / (hat_n_w.T @ O_c_w)) * hat_n_c.T @ d), axis=1)
 
-
+    # move the intersection point in camera frame to world frame
+    # this is done because we have bev mask in the world frame and to sample the correct location 
+    # from BEV mask we need world coordinates.
     tilde_x_w_1D = T_w_cTag @ T_cTag_c @ tilde_x_c_1D
 
+    # dehomogenize the world coordinates
     x_w_1D = tilde_x_w_1D[:, :3] / np.repeat(tilde_x_w_1D[:, 3:4], 3, 1) 
     x_c_1D = tilde_x_c_1D[:, :3] / np.repeat(tilde_x_c_1D[:, 3:4], 3, 1)
 
     x_e_1D = x_w_1D.copy()
+    # BEV mask is in the world frame not in ego frame hence this is not required. 
     # x_e_1D[:,1,0] = -x_e_1D[:,1,0]
-    x_e_1D[:, 2, 0] = -x_e_1D[:, 2, 0]
+    # x_e_1D[:, 2, 0] = -x_e_1D[:, 2, 0]
     
     valid_indices_1D = x_c_1D[:, 2, 0] > 0
     valid_indices_2D = valid_indices_1D[:, None].reshape(h, w)
+
+    # Convert world coordinates to BEV mask pixel coordinates
     u, v = x_e_1D[:, 0:1, 0].reshape(h, w), x_e_1D[:, 1:2, 0].reshape(h, w) 
     u = u / precalcedMM_meter2pixel + precalcedMM_centerPixel['Ox'] # pixel
     v = v / precalcedMM_meter2pixel + precalcedMM_centerPixel['Oy'] # pixel
@@ -350,6 +356,9 @@ def parse_camera_matrix(matrix_str):
 
 # Modify the for loop to use camera configurations
 for cam_config in cam_configs['cams']:
+
+    if cam_config['topic'] != 'Front':
+        continue
     # Get camera parameters from config
     translation = np.array([cam_config['x'], -cam_config['y'], -cam_config['z']])
     euler_angles = [-cam_config['heading'], -cam_config['pitch'], cam_config['roll']]
