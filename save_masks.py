@@ -1,5 +1,5 @@
 import numpy as np
-# from tools.nuscenes import NuScenes
+from tools.nuscenes import NuScenes
 import blosc
 import cv2
 import torch
@@ -9,6 +9,7 @@ import json
 import os
 import glob
 import numpy as np
+import re
 
 def visualize_mask(mask, img_path=None, alpha=0.5):
     """
@@ -109,6 +110,7 @@ cv2.imwrite('visualization.png', vis_img)
 """
 
 def get_gt(blosc_path, shape=(448, 560)):
+    blosc_path = blosc_path.replace('volumes', 'Data')
     with open(blosc_path, 'rb') as f:
         b = blosc.decompress(f.read())
         blosc_file = np.frombuffer(b, dtype=np.bool_).reshape(*shape, -1)
@@ -240,8 +242,8 @@ def calc_rotation_matrix(yaw, pitch, roll):
     R = Rz.dot(Ry).dot(Rx)
     return R
 
-def bev_to_camera_perspective_2(bev_mask, camera_intrinsic, euler_angles, translation_vector, img_shape,
-                            fov, bev_range=[-30, 75, -60, 60]):
+def bev_to_camera_perspective_2(bev_mask, camera_intrinsic, rotation_mat, translation_vector, img_shape,
+                            fov=-1, bev_range=[-30, 75, -60, 60]):
     """
     Transform BEV mask to perspective view using CamProjector
     """
@@ -249,7 +251,8 @@ def bev_to_camera_perspective_2(bev_mask, camera_intrinsic, euler_angles, transl
     k_inv = np.linalg.inv(camera_intrinsic)
     O_c_w = translation_vector
     R_c_cTag = np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]]).T
-    R_w_cTag = calc_rotation_matrix(euler_angles[0], euler_angles[1], euler_angles[2])
+    # R_w_cTag = calc_rotation_matrix(euler_angles[0], euler_angles[1], euler_angles[2])
+    R_w_cTag = rotation_mat
     precalcedMM_dims = {'h': 448, 'w': 560}
     precalcedMM_centerPixel = {'Ox': 280, 'Oy': 224}
     precalcedMM_meter2pixel = 75./280
@@ -328,26 +331,20 @@ def bev_to_camera_perspective_2(bev_mask, camera_intrinsic, euler_angles, transl
 # # Get sample data
 # samp = nusc.sample[0]
 
-# These euler angles are take from cam_config.json
-cam_to_euler_angles = {
-    'FRONT_LEFT': [52.117, 10.134, -2.515],
-    'BACK_LEFT': [138.698, -0.235, 0.425],
-    'FRONT': [-0.349, -8.539, -0.144],
-    'FRONT_MID_RANGE': [-0.349, -1.411, 0.886],
-    'FRONT_LONG_RANGE': [-0.212, -1.630, 0.438],
-    'BACK_RIGHT': [-142.955, 0.167, 1.852],
-    'FRONT_RIGHT': [-51.833, 10.538, 4.044],
-    'BACK': [180.583, 3.202, 1.111],
-}
 
 
+# trip_path = "/home/sonaalk/imagry/data/trips/trainval-mini/2024-06-13T15_55_46/"
+# bev_mask_path = "/home/Data/mm/san_jose_entron_train_04_04/2024-06-13T15_55_46/bigmap/trip_0_500_mm_0.blosc"
 
+# cam_configs = json.load(open(trip_path + 'cams_configs.json'))
 
-trip_path = "/home/sonaalk/imagry/data/trips/trainval-mini/2024-06-13T15_55_46/"
-bev_mask_path = "/home/Data/mm/san_jose_entron_train_04_04/2024-06-13T15_55_46/bigmap/trip_0_500_mm_0.blosc"
+import pickle
+data = pickle.load(open("/home/sonaalk/imagry/data/converted/imagry_temporal_infos_train.pkl", "rb"))
 
-cam_configs = json.load(open(trip_path + 'cams_configs.json'))
+sample_idx = 0
+bev_mask_path = data['infos'][sample_idx]['gt_map']
 
+camera_types = ["FRONT_LEFT", "BACK_LEFT", "FRONT", "FRONT_MID_RANGE", "FRONT_LONG_RANGE", "BACK_RIGHT", "FRONT_RIGHT", "BACK"]
 # First, let's create a function to parse the camera matrix string
 def parse_camera_matrix(matrix_str):
     """Convert camera matrix string to numpy array"""
@@ -355,39 +352,42 @@ def parse_camera_matrix(matrix_str):
 
 
 # Modify the for loop to use camera configurations
-for cam_config in cam_configs['cams']:
+for cam_type in camera_types:
 
-    if cam_config['topic'] != 'Front':
-        continue
+    # if cam_type != 'FRONT':
+    #     continue
+    translation = data['infos'][sample_idx]['cams'][cam_type]['sensor2ego_translation']
+    rotation_in_quat = data['infos'][sample_idx]['cams'][cam_type]['sensor2ego_rotation']
+    rotation_in_quat = [rotation_in_quat[1], rotation_in_quat[2], rotation_in_quat[3], rotation_in_quat[0]]
+    rotation_mat = Rotation.from_quat(rotation_in_quat).as_matrix()
+    
+    print(rotation_mat, translation)
     # Get camera parameters from config
-    translation = np.array([cam_config['x'], -cam_config['y'], -cam_config['z']])
-    euler_angles = [-cam_config['heading'], -cam_config['pitch'], cam_config['roll']]
+    # euler_angles = [-cam_config['heading'], -cam_config['pitch'], cam_config['roll']]
         
     # Parse camera matrix
-    cam_intrinsic = parse_camera_matrix(cam_config['new_camera_matrix'])
-    
-    img_path = sorted(glob.glob(f"{trip_path}/3d_images/{cam_config['index']}/left/*.jpeg"))[0]  # Adjust this path as needed
-    print("CAMERA:", cam_config['topic'], "IMAGE PATH:", img_path)
+    cam_intrinsic = data['infos'][sample_idx]['cams'][cam_type]['cam_intrinsic']
+
+    img_path = data['infos'][sample_idx]['cams'][cam_type]['data_path']
     # Get BEV mask
     bev_mask = get_gt(bev_mask_path)
 
-    # Get FOV from config instead of calculating
-    horizontal_fov = cam_config['h_fov']
-    vertical_fov = cam_config['v_fov']
+    # # Get FOV from config instead of calculating
+    # horizontal_fov = cam_config['h_fov']
+    # vertical_fov = cam_config['v_fov']
 
     # Transform to perspective view
     pv_mask = bev_to_camera_perspective_2(
         bev_mask, 
         cam_intrinsic, 
-        euler_angles, 
+        rotation_mat, 
         translation, 
         (1080, 1920),
-        horizontal_fov
     )
 
     # Visualize and save
     vis_pv_mask = visualize_mask(pv_mask, img_path)
-    cv2.imwrite(f'visualization_{cam_config["topic"]}.png', vis_pv_mask)
+    cv2.imwrite(f'visualization_{cam_type}.png', vis_pv_mask)
 
 vis_bev_mask = visualize_mask(bev_mask)
 cv2.imwrite('gt_mask.png', vis_bev_mask)
